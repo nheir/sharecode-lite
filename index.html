@@ -1,0 +1,222 @@
+<html>
+<head>
+	<meta charset="utf-8">
+	<title>Share code</title>
+	<link rel="shortcut icon" href="data:image/x-icon;," type="image/x-icon">
+	<script src="peerjs.min.js"></script>
+	<!-- Add codemirror files -->
+	<link rel="stylesheet" href="codemirror/lib/codemirror.css">
+	<script src="codemirror/lib/codemirror.js"></script>
+	<script src="codemirror/mode/meta.js"></script>
+	<script src="codemirror/addon/selection/active-line.js"></script>
+	<script src="codemirror/mode/markdown/markdown.js"></script>
+	<style>
+		.CodeMirror {
+	  border: 1px solid #eee;
+	  height: auto;
+	}
+	</style>
+</head>
+<body>
+	<p class="master">
+		<select id="lang"></select><br/>
+		<label>Client URL:</label> <a id="url"></a><br/>
+		<select id="token"></select>
+	</p>
+	<p class="student" style="display: none">
+		<label>ID:</label>
+		<span></span>
+	</p>
+	<div>
+		<code><textarea id="code"></textarea></code>
+	</div>
+	<script type="text/javascript">
+		const code = document.getElementById('code');
+
+		const editor = CodeMirror.fromTextArea(code, {
+			lineNumbers: true,
+  		styleActiveLine: true,
+		});
+
+		// get master peerjs ID
+		const hash = document.location.hash;
+		const master = !hash;
+
+		// get some short unique public ID
+		const name = btoa(+new Date() + Math.random()).slice(-10,-2);
+
+		// peerjs options
+		const webRTCOption = {
+			// host: 'some.peerjs.server',
+			// path: '/path',
+			// key: 'my_key',
+		};
+
+		// retrieve the old ID if master
+		const storageKey = "sharecode-lite-id";
+		const oldID = sessionStorage.getItem(storageKey);
+		const peer = master && oldID ? new Peer(oldID, webRTCOption) : new Peer(webRTCOption);
+
+		// record peerjs id
+		peer.on('open', (id) => sessionStorage.setItem(storageKey, id));
+		peer.on('error', (err) => {
+			if (err.type == 'unavailable-id')
+				sessionStorage.removeItem(storageKey);
+			console.error(err);
+		});
+
+		const peers = new Map();
+		function broadcast(data) {
+			for (const conn of peers.values())
+				conn.send(data);
+		}
+
+		let token = master;
+
+		// broadcast (master -> students or student -> master) the doc content and the cursor position when we have the write token
+		editor.getDoc().on('change', (doc, changeObj) => {
+			if (!token) return;
+			editor.save()
+			const head = doc.getCursor('head');
+			const anchor = doc.getCursor('anchor');
+			const selection = {
+				head: { line: head.line, ch: head.ch },
+				anchor:{ line: anchor.line, ch: anchor.ch },
+			};
+			broadcast({code: doc.getValue(), selection: selection});
+		});
+
+		// broadcast (master -> students or student -> master) the cursor position when we have the write token
+		editor.getDoc().on("cursorActivity", (doc) => {
+			if (!token) return;
+			const head = doc.getCursor('head');
+			const anchor = doc.getCursor('anchor');
+			const selection = {
+				head: { line: head.line, ch: head.ch },
+				anchor:{ line: anchor.line, ch: anchor.ch },
+			};
+			broadcast({selection: selection});
+		});
+
+		// readonly by default for students
+		editor.setOption("readOnly", !master);
+
+		if (master) {
+			// language selector
+			const selectLang = document.getElementById('lang');
+			for (const lang of Object.getOwnPropertyNames(CodeMirror.mimeModes)) {
+				const option = document.createElement('option');
+				option.value = lang;
+				option.textContent = (CodeMirror.findModeByMIME(lang) && CodeMirror.findModeByMIME(lang).name) || lang;
+				selectLang.appendChild(option);
+			}
+			selectLang.addEventListener('change', () => {
+				editor.setOption('mode', selectLang.value);
+				broadcast({lang: selectLang.value});
+			});
+
+			// student selector to give the write token
+			const tokenSelect = document.getElementById('token');
+			function updateTokenSelect() {
+				tokenSelect.innerHTML = '';
+				const option = document.createElement('option');
+				option.value = peer.id;
+				option.textContent = 'Master';
+				tokenSelect.appendChild(option);
+
+				for (const [id, conn] of peers) {
+					const option = document.createElement('option');
+					option.value = id;
+					option.textContent = conn.metadata.name;
+					tokenSelect.appendChild(option);
+				}
+			}
+			tokenSelect.addEventListener('change', () => {
+				broadcast({token: 'remove'});
+				const conn = peers.get(tokenSelect.value);
+				if (conn) {
+					conn.send({token: 'give'});
+					token = false;
+				}
+				else token = true;
+				editor.setOption("readOnly", !token);
+			});
+
+			peer.on('open', function(id) {
+			  console.log('My peer ID is: ' + id);
+			  const url = document.getElementById("url");
+			  url.href = document.location.href + '#' + id;
+			  url.textContent = url.href;
+
+				updateTokenSelect();
+			});
+
+			// new student handler
+			peer.on('connection', (conn) => {
+				console.log('Got a connection', conn.peer);
+				peers.set(conn.peer, conn);
+				updateTokenSelect();
+
+				conn.on('open', () =>
+					conn.send({lang: selectLang.value, code: code.value})
+				);
+				conn.on('close error', () => {
+					peers.remove(conn.peer);
+				});
+				// relay changes
+				conn.on('data', (data) => {
+					if (!token) {
+						if (data.code) {
+							const scrollInfo = editor.getScrollInfo();
+							editor.getDoc().setValue(data.code);
+							editor.scrollTo(scrollInfo.left, scrollInfo.top);
+						}
+						if (data.selection)
+							editor.getDoc().setSelection(data.selection.anchor, data.selection.head);
+						if (data.code || data.selection)
+							broadcast({code: data.code, selection: data.selection});
+					}
+					if (token) conn.send({token: 'remove'});
+				})
+			});
+		} else {
+			document.querySelector('.master').style.display = 'none';
+			document.querySelector('.student').style.display = '';
+			document.querySelector('.student span').innerHTML = name;
+
+			peer.on('open', function(id) {
+				const conn = peer.connect(hash.slice(1), {
+					metadata: {
+						name: name
+					}
+				});
+				peers.set(hash.slice(1), conn);
+				// the student only receives data from the master
+				conn.on('data', (data) => {
+					if (!token) {
+						if (data.code) {
+							const scrollInfo = editor.getScrollInfo();
+							editor.getDoc().setValue(data.code);
+							editor.scrollTo(scrollInfo.left, scrollInfo.top);
+						}
+						if (data.selection)
+							editor.getDoc().setSelection(data.selection.anchor, data.selection.head);
+					}
+					if (data.lang)
+						editor.setOption('mode', data.lang);
+					// token
+					if (data.token == 'give') {
+						editor.setOption("readOnly", false);
+						token = true;
+					}
+					if (data.token == 'remove') {
+						editor.setOption("readOnly", true);
+						token = false;
+					}
+				});
+			});
+		}
+
+	</script>
+</body>
+</html>
